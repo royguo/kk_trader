@@ -26,6 +26,26 @@ PORTFOLIO = {
     "hk01810":  {"name": "小米集团", "yahoo": "1810.HK",   "cost": 32.38},
 }
 
+# --- 关注列表（无成本价） ---
+WATCHLIST = {
+    "hk09992":  {"name": "泡泡玛特",       "yahoo": "9992.HK"},
+    "hk07709":  {"name": "南方2x海力士",    "yahoo": "7709.HK"},
+    "sz002400": {"name": "省广集团",        "yahoo": "002400.SZ"},
+    "hk00700":  {"name": "腾讯控股",        "yahoo": "0700.HK"},
+    "hk03690":  {"name": "美团",            "yahoo": "3690.HK"},
+    "hk09888":  {"name": "百度集团",        "yahoo": "9888.HK"},
+    "hk09988":  {"name": "阿里巴巴",        "yahoo": "9988.HK"},
+    "sh603986": {"name": "兆易创新",        "yahoo": "603986.SS"},
+    "sh688008": {"name": "澜起科技",        "yahoo": "688008.SS"},
+    "sz301308": {"name": "江波龙",          "yahoo": "301308.SZ"},
+}
+
+# --- 美股关注列表（单独处理，腾讯API用 us 前缀） ---
+US_WATCHLIST = {
+    "usSNDK":   {"name": "闪迪",    "yahoo": "SNDK"},
+    "usNVDA":   {"name": "英伟达",  "yahoo": "NVDA"},
+}
+
 INDEXES = {
     "sh000001": {"name": "上证指数", "yahoo": "000001.SS"},
     "sz399001": {"name": "深证成指", "yahoo": "399001.SZ"},
@@ -128,8 +148,8 @@ def main():
     show_portfolio = not custom_codes
 
     if show_portfolio:
-        tencent_codes = list(INDEXES.keys()) + list(PORTFOLIO.keys())
-        yahoo_syms = [v["yahoo"] for v in list(INDEXES.values()) + list(PORTFOLIO.values())]
+        tencent_codes = list(INDEXES.keys()) + list(PORTFOLIO.keys()) + list(WATCHLIST.keys()) + list(US_WATCHLIST.keys())
+        yahoo_syms = [v["yahoo"] for v in list(INDEXES.values()) + list(PORTFOLIO.values()) + list(WATCHLIST.values()) + list(US_WATCHLIST.values())]
     else:
         tencent_codes = custom_codes
         yahoo_syms = []
@@ -180,6 +200,32 @@ def main():
             if td.get("datetime"):
                 dt = td["datetime"]
                 break
+
+        # --- 关注列表（A股/港股） ---
+        print("\n## 👀 关注列表\n")
+        print("| 标的 | 现价 | 涨跌幅 | 验证 | 备注 |")
+        print("|------|------|--------|------|------|")
+        for code_key, info in WATCHLIST.items():
+            td = tencent_data.get(code_key, {})
+            yp = yahoo_data.get(info["yahoo"], 0)
+            tp = td.get("price", 0)
+            price, st, note = cross_validate(tp, yp)
+            chg = td.get("change_pct", 0)
+            sign = "+" if chg >= 0 else ""
+            print("| %s | %.2f | %s%.2f%% | %s | %s |" % (
+                info["name"], price, sign, chg, status_emoji(st), note))
+
+        # --- 美股关注列表 ---
+        for code_key, info in US_WATCHLIST.items():
+            td = tencent_data.get(code_key, {})
+            yp = yahoo_data.get(info["yahoo"], 0)
+            tp = td.get("price", 0)
+            price, st, note = cross_validate(tp, yp)
+            chg = td.get("change_pct", 0)
+            sign = "+" if chg >= 0 else ""
+            print("| %s | %.2f | %s%.2f%% | %s | %s |" % (
+                info["name"], price, sign, chg, status_emoji(st), note))
+
         print("\n> 数据时间: %s | 腾讯: %d/%d | 雅虎: %d/%d" % (
             dt,
             len(tencent_data), len(tencent_codes),
