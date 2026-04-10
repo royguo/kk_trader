@@ -1,148 +1,195 @@
 #!/usr/bin/env python3
 """
-实时行情获取工具 — 基于腾讯财经 API
-支持 A股、港股、美股 实时行情查询
+实时行情获取工具 -- 双数据源交叉验证
 
-API: http://qt.gtimg.cn/q={code}
-  - A股: sz000021 / sh600809
-  - 港股: hk01810
-  - 美股: usAAPL
-  - 指数: sh000001 / sz399001 / hkHSI
-  - 支持批量: 逗号分隔
+数据源:
+  1. 腾讯财经 API (qt.gtimg.cn) -- 主力源
+  2. Yahoo Finance API (query1.finance.yahoo.com) -- 验证源
 
-无需认证，无需 Referer，返回 GBK 编码文本
+双源策略:
+  - 同时从两个源获取价格
+  - 若两源价格偏差 > 1%, 标记警告
+  - 若某源不可用, 回退到单源并标注
 """
 
 import sys
+import json
 import urllib.request
 
-# --- 默认关注列表 ---
+# --- 持仓配置 ---
 PORTFOLIO = {
-    "sz000021": "深科技",
-    "sz000400": "许继电气",
-    "sz002050": "三花智控",
-    "sz002156": "通富微电",
-    "sh600809": "山西汾酒",
-    "hk01810":  "小米集团",
+    "sz000021": {"name": "深科技",   "yahoo": "000021.SZ", "cost": 29.21},
+    "sz000400": {"name": "许继电气", "yahoo": "000400.SZ", "cost": 29.14},
+    "sz002050": {"name": "三花智控", "yahoo": "002050.SZ", "cost": 42.97},
+    "sz002156": {"name": "通富微电", "yahoo": "002156.SZ", "cost": 42.59},
+    "sh600809": {"name": "山西汾酒", "yahoo": "600809.SS", "cost": 152.83},
+    "hk01810":  {"name": "小米集团", "yahoo": "1810.HK",   "cost": 32.38},
 }
 
 INDEXES = {
-    "sh000001": "上证指数",
-    "sz399001": "深证成指",
-    "sz399006": "创业板指",
-    "hkHSI":    "恒生指数",
+    "sh000001": {"name": "上证指数", "yahoo": "000001.SS"},
+    "sz399001": {"name": "深证成指", "yahoo": "399001.SZ"},
+    "sz399006": {"name": "创业板指", "yahoo": "399006.SZ"},
+    "hkHSI":    {"name": "恒生指数", "yahoo": "^HSI"},
 }
 
-# 持仓成本（用于计算盈亏）
-COST = {
-    "sz000021": 29.21,
-    "sz000400": 29.14,
-    "sz002050": 42.97,
-    "sz002156": 42.59,
-    "sh600809": 152.83,
-    "hk01810":  32.38,
-}
+DEVIATION_THRESHOLD = 0.01  # 1% 偏差阈值
 
 
-def fetch_quotes(codes):
-    """调用腾讯财经 API 获取实时行情原始数据"""
-    url = f"http://qt.gtimg.cn/q={','.join(codes)}"
-    req = urllib.request.Request(url)
-    req.add_header("User-Agent", "Mozilla/5.0")
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return resp.read().decode("gbk")
+# ========== 数据源 1: 腾讯财经 ==========
+
+def fetch_tencent(codes):
+    """从腾讯财经获取行情"""
+    url = "http://qt.gtimg.cn/q=" + ",".join(codes)
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("gbk")
+    except Exception as e:
+        sys.stderr.write("Warning: Tencent API failed: %s\n" % e)
+        return {}
+
+    result = {}
+    for line in raw.split(";"):
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        var_name, value = line.split("=", 1)
+        fields = value.strip('"').split("~")
+        if len(fields) < 35:
+            continue
+        code_key = var_name.replace("v_", "")
+        try:
+            result[code_key] = {
+                "name": fields[1],
+                "price": float(fields[3]) if fields[3] else 0,
+                "prev_close": float(fields[4]) if fields[4] else 0,
+                "change_pct": float(fields[32]) if fields[32] else 0,
+                "high": float(fields[33]) if fields[33] else 0,
+                "low": float(fields[34]) if fields[34] else 0,
+                "datetime": fields[30],
+            }
+        except (ValueError, IndexError):
+            continue
+    return result
 
 
-def parse_quote(raw_line):
-    """解析单条腾讯行情数据，返回结构化字典"""
-    raw_line = raw_line.strip().rstrip(";").strip()
-    if not raw_line or "=" not in raw_line:
-        return None
+# ========== 数据源 2: Yahoo Finance ==========
 
-    var_name, value = raw_line.split("=", 1)
-    value = value.strip('"')
-    fields = value.split("~")
+def fetch_yahoo(symbols):
+    """从 Yahoo Finance 获取行情"""
+    result = {}
+    for sym in symbols:
+        url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+               + sym + "?interval=1d&range=1d")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            meta = data["chart"]["result"][0]["meta"]
+            result[sym] = float(meta["regularMarketPrice"])
+        except Exception:
+            continue
+    return result
 
-    if len(fields) < 35:
-        return None
 
-    code_key = var_name.replace("v_", "")
+# ========== 交叉验证 ==========
 
-    return {
-        "code_key": code_key,
-        "market": fields[0],       # 1=沪, 51=深, 100=港, 200=美
-        "name": fields[1],
-        "code": fields[2],
-        "price": float(fields[3]) if fields[3] else 0,
-        "prev_close": float(fields[4]) if fields[4] else 0,
-        "open": float(fields[5]) if fields[5] else 0,
-        "change": float(fields[31]) if fields[31] else 0,
-        "change_pct": float(fields[32]) if fields[32] else 0,
-        "high": float(fields[33]) if fields[33] else 0,
-        "low": float(fields[34]) if fields[34] else 0,
-        "datetime": fields[30],
-    }
+def cross_validate(tencent_price, yahoo_price):
+    """比较两源价格, 返回 (final_price, status, note)"""
+    if tencent_price and yahoo_price:
+        avg = (tencent_price + yahoo_price) / 2
+        dev = abs(tencent_price - yahoo_price) / avg
+        if dev > DEVIATION_THRESHOLD:
+            return avg, "WARN", "dev %.2f%% (T:%.2f/Y:%.2f)" % (dev*100, tencent_price, yahoo_price)
+        return tencent_price, "OK", ""
+    elif tencent_price:
+        return tencent_price, "T_ONLY", ""
+    elif yahoo_price:
+        return yahoo_price, "Y_ONLY", ""
+    return 0, "FAIL", "both sources failed"
+
+
+def status_emoji(status):
+    return {"OK": "✅", "WARN": "⚠️", "T_ONLY": "🅰️", "Y_ONLY": "🅱️", "FAIL": "❌"}.get(status, "?")
 
 
 def format_pnl(price, cost):
-    """格式化盈亏百分比"""
-    if cost == 0:
-        return "—"
+    if cost == 0 or price == 0:
+        return "---"
     pnl = (price - cost) / cost * 100
     sign = "+" if pnl >= 0 else ""
     emoji = "🟢" if pnl > 0 else ("🔴" if pnl < -5 else "🟡")
-    return f"{emoji} {sign}{pnl:.2f}%"
+    return "%s %s%.2f%%" % (emoji, sign, pnl)
 
 
 def main():
-    codes = list(sys.argv[1:]) if len(sys.argv) > 1 else []
-    show_portfolio = not codes
+    custom_codes = list(sys.argv[1:]) if len(sys.argv) > 1 else []
+    show_portfolio = not custom_codes
 
     if show_portfolio:
-        codes = list(INDEXES.keys()) + list(PORTFOLIO.keys())
+        tencent_codes = list(INDEXES.keys()) + list(PORTFOLIO.keys())
+        yahoo_syms = [v["yahoo"] for v in list(INDEXES.values()) + list(PORTFOLIO.values())]
+    else:
+        tencent_codes = custom_codes
+        yahoo_syms = []
 
-    raw = fetch_quotes(codes)
-    lines = [l.strip() for l in raw.split(";") if l.strip()]
+    # 获取双源数据
+    tencent_data = fetch_tencent(tencent_codes)
+    yahoo_data = fetch_yahoo(yahoo_syms) if yahoo_syms else {}
 
-    quotes = []
-    for line in lines:
-        q = parse_quote(line)
-        if q:
-            quotes.append(q)
-
-    if not quotes:
-        print("⚠️  未获取到数据")
+    if not tencent_data and not yahoo_data:
+        print("Error: both data sources failed!")
         return
 
     if show_portfolio:
-        # 指数部分
+        # --- 指数 ---
         print("## 📈 市场指数\n")
-        print(f"| 指数 | 最新价 | 涨跌 | 涨跌幅 | 最高 | 最低 |")
-        print(f"|------|--------|------|--------|------|------|")
-        for q in quotes:
-            if q["code_key"] in INDEXES:
-                sign = "+" if q["change"] >= 0 else ""
-                print(f"| {q['name']} | {q['price']:.2f} | {sign}{q['change']:.2f} | {sign}{q['change_pct']:.2f}% | {q['high']:.2f} | {q['low']:.2f} |")
+        print("| 指数 | 最新价 | 涨跌幅 | 最高 | 最低 | 验证 |")
+        print("|------|--------|--------|------|------|------|")
+        for code_key, info in INDEXES.items():
+            td = tencent_data.get(code_key, {})
+            yp = yahoo_data.get(info["yahoo"], 0)
+            tp = td.get("price", 0)
+            price, st, note = cross_validate(tp, yp)
+            chg = td.get("change_pct", 0)
+            sign = "+" if chg >= 0 else ""
+            print("| %s | %.2f | %s%.2f%% | %.2f | %.2f | %s |" % (
+                info["name"], price, sign, chg,
+                td.get("high", 0), td.get("low", 0), status_emoji(st)))
         print()
 
-        # 持仓部分
-        print("## 💼 持仓行情\n")
-        print(f"| 标的 | 代码 | 最新价 | 涨跌幅 | 成本 | 盈亏 | 最高 | 最低 |")
-        print(f"|------|------|--------|--------|------|------|------|------|")
-        for q in quotes:
-            if q["code_key"] in PORTFOLIO:
-                cost = COST.get(q["code_key"], 0)
-                pnl = format_pnl(q["price"], cost)
-                sign = "+" if q["change_pct"] >= 0 else ""
-                print(f"| {q['name']} | {q['code']} | {q['price']:.2f} | {sign}{q['change_pct']:.2f}% | {cost:.2f} | {pnl} | {q['high']:.2f} | {q['low']:.2f} |")
-        print(f"\n> 数据时间: {quotes[-1]['datetime']}")
+        # --- 持仓 ---
+        print("## 💼 持仓行情（双源验证）\n")
+        print("| 标的 | 现价 | 涨跌幅 | 成本 | 盈亏 | 验证 | 备注 |")
+        print("|------|------|--------|------|------|------|------|")
+        for code_key, info in PORTFOLIO.items():
+            td = tencent_data.get(code_key, {})
+            yp = yahoo_data.get(info["yahoo"], 0)
+            tp = td.get("price", 0)
+            price, st, note = cross_validate(tp, yp)
+            chg = td.get("change_pct", 0)
+            sign = "+" if chg >= 0 else ""
+            pnl = format_pnl(price, info["cost"])
+            print("| %s | %.2f | %s%.2f%% | %.2f | %s | %s | %s |" % (
+                info["name"], price, sign, chg, info["cost"], pnl, status_emoji(st), note))
+
+        # --- 摘要 ---
+        dt = ""
+        for td in tencent_data.values():
+            if td.get("datetime"):
+                dt = td["datetime"]
+                break
+        print("\n> 数据时间: %s | 腾讯: %d/%d | 雅虎: %d/%d" % (
+            dt,
+            len(tencent_data), len(tencent_codes),
+            len(yahoo_data), len(yahoo_syms)))
+
     else:
-        # 自定义查询
-        for q in quotes:
-            cost = COST.get(q["code_key"], 0)
-            pnl_str = f" | 盈亏: {format_pnl(q['price'], cost)}" if cost else ""
-            sign = "+" if q["change_pct"] >= 0 else ""
-            print(f"{q['name']}({q['code']}) 现价: {q['price']:.2f}  {sign}{q['change_pct']:.2f}%{pnl_str}")
+        for code_key, td in tencent_data.items():
+            sign = "+" if td["change_pct"] >= 0 else ""
+            print("%s(%s) %.2f  %s%.2f%%" % (
+                td["name"], code_key, td["price"], sign, td["change_pct"]))
 
 
 if __name__ == "__main__":
